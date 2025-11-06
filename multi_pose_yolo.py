@@ -28,7 +28,7 @@ except ImportError:
 class MultiPoseDetectorYOLO:
     """Handles multi-person pose detection using YOLO + MediaPipe."""
     
-    def __init__(self, source=0, max_people=5, yolo_model='yolov8n.pt'):
+    def __init__(self, source=0, max_people=5, yolo_model='yolov8n.pt', single_person=False):
         self.source = source
         self.is_video_file = isinstance(source, str)
         self.cap = None
@@ -40,9 +40,19 @@ class MultiPoseDetectorYOLO:
         self.frame_skip = 0  # Counter for frame skipping
         self.yolo_interval = 3  # Run YOLO every N frames
         self.cached_bboxes = []  # Cache YOLO detections
+        self.single_person = single_person
         
-        # YOLO setup
-        if YOLO_AVAILABLE:
+        # Person tracking (to maintain consistent IDs)
+        self.tracked_people = {}  # {person_id: {'bbox': (x1,y1,x2,y2), 'last_seen': frame_num}}
+        self.next_person_id = 0
+        self.current_frame_num = 0
+        self.iou_threshold = 0.3  # IoU threshold for matching bboxes
+        
+        # YOLO setup (skip if single_person mode)
+        if single_person:
+            print("Single-person mode enabled (no YOLO, faster rendering)")
+            self.yolo = None
+        elif YOLO_AVAILABLE:
             print(f"Loading YOLO model: {yolo_model}")
             self.yolo = YOLO(yolo_model)
             print("YOLO model loaded!")
@@ -80,6 +90,11 @@ class MultiPoseDetectorYOLO:
         
     def _detect_people_yolo(self, frame):
         """Detect people using YOLO and return bounding boxes."""
+        # Single person mode - return full frame
+        if self.single_person:
+            h, w = frame.shape[:2]
+            return [(0, 0, w, h)]
+        
         if not YOLO_AVAILABLE or self.yolo is None:
             # Fallback: return full frame as single person
             h, w = frame.shape[:2]
@@ -107,17 +122,88 @@ class MultiPoseDetectorYOLO:
         self.frame_skip = 0
         return self.cached_bboxes
     
+    def _calculate_iou(self, bbox1, bbox2):
+        """Calculate Intersection over Union (IoU) between two bounding boxes."""
+        x1_1, y1_1, x2_1, y2_1 = bbox1
+        x1_2, y1_2, x2_2, y2_2 = bbox2
+        
+        # Calculate intersection area
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i < x1_i or y2_i < y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union area
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def _track_bboxes(self, bboxes):
+        """Assign consistent IDs to detected bboxes based on IoU matching."""
+        self.current_frame_num += 1
+        
+        # Remove people not seen for 30 frames
+        max_missing_frames = 30
+        self.tracked_people = {
+            pid: data for pid, data in self.tracked_people.items()
+            if self.current_frame_num - data['last_seen'] < max_missing_frames
+        }
+        
+        tracked_bboxes = []
+        used_person_ids = set()
+        
+        for bbox in bboxes:
+            best_match_id = None
+            best_iou = 0
+            
+            # Find best matching tracked person
+            for person_id, tracked_data in self.tracked_people.items():
+                if person_id in used_person_ids:
+                    continue
+                
+                iou = self._calculate_iou(bbox, tracked_data['bbox'])
+                if iou > self.iou_threshold and iou > best_iou:
+                    best_iou = iou
+                    best_match_id = person_id
+            
+            # Assign ID
+            if best_match_id is not None:
+                person_id = best_match_id
+            else:
+                person_id = self.next_person_id
+                self.next_person_id += 1
+            
+            used_person_ids.add(person_id)
+            
+            # Update tracking
+            self.tracked_people[person_id] = {
+                'bbox': bbox,
+                'last_seen': self.current_frame_num
+            }
+            
+            tracked_bboxes.append((bbox, person_id))
+        
+        return tracked_bboxes
+    
     def _detection_loop(self):
         """Continuously detect poses from webcam or video."""
         # Create pose detector instances with optimized settings
+        num_detectors = 1 if self.single_person else self.max_people
         pose_detectors = [
             self.mp_pose.Pose(
                 static_image_mode=False,
-                model_complexity=0,  # Use lite model for speed
+                model_complexity=1 if self.single_person else 0,  # Higher quality for single person
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5
             )
-            for _ in range(self.max_people)
+            for _ in range(num_detectors)
         ]
         
         try:
@@ -162,14 +248,7 @@ class MultiPoseDetectorYOLO:
                     if person_crop.size == 0:
                         continue
                     
-                    # Resize crop for faster processing
-                    crop_h, crop_w = person_crop.shape[:2]
-                    if crop_h > 480:  # Only resize if large
-                        scale = 480 / crop_h
-                        new_w = int(crop_w * scale)
-                        person_crop = cv2.resize(person_crop, (new_w, 480))
-                    
-                    # Process with MediaPipe Pose
+                    # Process with MediaPipe Pose (don't resize - keep original crop dimensions)
                     person_crop.flags.writeable = False
                     crop_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
                     
@@ -363,14 +442,15 @@ def draw_grid():
     glEnable(GL_LIGHTING)
 
 
-def main(source=0, max_people=5, yolo_model='yolov8n.pt'):
+def main(source=0, max_people=5, yolo_model='yolov8n.pt', single_person=False):
     """Main application loop."""
     # Initialize Pygame and OpenGL
     pygame.init()
     display = (1200, 700)
     pygame.display.set_mode(display, DOUBLEBUF | OPENGL | RESIZABLE)
     
-    title = f"Multi-Person Pose (YOLO+Pose) - {source if isinstance(source, str) else 'Webcam'}"
+    mode = "Single-Person (Fast)" if single_person else "Multi-Person (YOLO+Pose)"
+    title = f"{mode} - {source if isinstance(source, str) else 'Webcam'}"
     pygame.display.set_caption(title)
     
     # Initialize GLUT for drawing spheres
@@ -379,7 +459,7 @@ def main(source=0, max_people=5, yolo_model='yolov8n.pt'):
     init_opengl(display[0], display[1])
     
     # Create detector
-    detector = MultiPoseDetectorYOLO(source, max_people=max_people, yolo_model=yolo_model)
+    detector = MultiPoseDetectorYOLO(source, max_people=max_people, yolo_model=yolo_model, single_person=single_person)
     
     # Create characters with different colors
     colors = [
@@ -413,11 +493,13 @@ def main(source=0, max_people=5, yolo_model='yolov8n.pt'):
     clock = pygame.time.Clock()
     running = True
     
-    print("\n3D Multi-Person Pose Detection (YOLO + MediaPipe) Started!")
-    if YOLO_AVAILABLE:
-        print(f"Using YOLO model: {yolo_model}")
+    print(f"\n3D Pose Detection Started!")
+    if single_person:
+        print("Mode: Single-person (fast, no YOLO)")
+    elif YOLO_AVAILABLE:
+        print(f"Mode: Multi-person with YOLO model: {yolo_model}")
     else:
-        print("YOLO not available - single person mode")
+        print("Mode: Single-person (YOLO not available)")
     print("\nControls:")
     print("  ESC/Q - Quit")
     print("  Left Mouse + Drag - Rotate camera")
@@ -501,19 +583,11 @@ def main(source=0, max_people=5, yolo_model='yolov8n.pt'):
         # Update characters
         results_list = detector.get_results()
         
-        # Calculate spacing for multiple people
-        num_people = len(results_list)
-        spacing = 3.0  # Space between people
-        
+        # No artificial spacing - landmarks are already in correct positions
         for i, result in enumerate(results_list):
             if i < len(characters):
                 characters[i].update_landmarks(result['landmarks'])
-                # Offset characters horizontally if multiple people
-                if num_people > 1:
-                    offset = (i - (num_people - 1) / 2) * spacing
-                    characters[i].set_offset(offset)
-                else:
-                    characters[i].set_offset(0)
+                characters[i].set_offset(0)  # No offset - use actual positions
         
         # Clear screen
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -571,6 +645,8 @@ if __name__ == '__main__':
                        help='Maximum number of people to detect (default: 5)')
     parser.add_argument('--yolo-model', type=str, default='yolov8n.pt',
                        help='YOLO model to use (default: yolov8n.pt, options: yolov8s.pt, yolov8m.pt, etc.)')
+    parser.add_argument('--single-person', action='store_true',
+                       help='Fast single-person mode (skips YOLO, ~2-3x faster)')
     
     args = parser.parse_args()
     
@@ -581,7 +657,7 @@ if __name__ == '__main__':
         source = args.camera if args.camera is not None else 0
     
     try:
-        main(source=source, max_people=args.max_people, yolo_model=args.yolo_model)
+        main(source=source, max_people=args.max_people, yolo_model=args.yolo_model, single_person=args.single_person)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     except Exception as e:
