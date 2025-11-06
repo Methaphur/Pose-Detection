@@ -42,12 +42,6 @@ class MultiPoseDetectorYOLO:
         self.cached_bboxes = []  # Cache YOLO detections
         self.single_person = single_person
         
-        # Person tracking (to maintain consistent IDs)
-        self.tracked_people = {}  # {person_id: {'bbox': (x1,y1,x2,y2), 'last_seen': frame_num}}
-        self.next_person_id = 0
-        self.current_frame_num = 0
-        self.iou_threshold = 0.3  # IoU threshold for matching bboxes
-        
         # YOLO setup (skip if single_person mode)
         if single_person:
             print("Single-person mode enabled (no YOLO, faster rendering)")
@@ -62,6 +56,12 @@ class MultiPoseDetectorYOLO:
         # MediaPipe setup
         self.mp_pose = mp.solutions.pose
         self.mp_drawing = mp.solutions.drawing_utils
+        
+        # Person tracking (to maintain consistent IDs)
+        self.tracked_people = {}  # {person_id: {'bbox': (x1,y1,x2,y2), 'last_seen': frame_num}}
+        self.next_person_id = 0
+        self.current_frame_num = 0
+        self.iou_threshold = 0.3  # IoU threshold for matching bboxes
         
     def start(self):
         """Start the pose detection thread."""
@@ -145,8 +145,8 @@ class MultiPoseDetectorYOLO:
         
         return intersection / union if union > 0 else 0.0
     
-    def _track_bboxes(self, bboxes):
-        """Assign consistent IDs to detected bboxes based on IoU matching."""
+    def _track_people(self, bboxes):
+        """Assign consistent IDs to detected people based on IoU matching."""
         self.current_frame_num += 1
         
         # Remove people not seen for 30 frames
@@ -188,7 +188,10 @@ class MultiPoseDetectorYOLO:
                 'last_seen': self.current_frame_num
             }
             
-            tracked_bboxes.append((bbox, person_id))
+            tracked_bboxes.append({
+                'bbox': bbox,
+                'person_id': person_id
+            })
         
         return tracked_bboxes
     
@@ -225,12 +228,18 @@ class MultiPoseDetectorYOLO:
                 # Detect people with YOLO
                 person_bboxes = self._detect_people_yolo(frame)
                 
+                # Track people to maintain consistent IDs
+                tracked_bboxes = self._track_people(person_bboxes)
+                
                 # Process each detected person
                 results_list = []
                 
-                for i, bbox in enumerate(person_bboxes):
-                    if i >= self.max_people:
-                        break
+                for tracked in tracked_bboxes:
+                    bbox = tracked['bbox']
+                    person_id = tracked['person_id']
+                    
+                    if person_id >= self.max_people:
+                        continue
                     
                     x1, y1, x2, y2 = bbox
                     
@@ -252,7 +261,9 @@ class MultiPoseDetectorYOLO:
                     person_crop.flags.writeable = False
                     crop_rgb = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
                     
-                    result = pose_detectors[i].process(crop_rgb)
+                    # Use detector based on person_id (cycle through available detectors)
+                    detector_idx = person_id % len(pose_detectors)
+                    result = pose_detectors[detector_idx].process(crop_rgb)
                     
                     if result.pose_landmarks:
                         # Adjust landmarks to full frame coordinates
@@ -262,7 +273,8 @@ class MultiPoseDetectorYOLO:
                         )
                         results_list.append({
                             'landmarks': adjusted_landmarks,
-                            'bbox': bbox
+                            'bbox': bbox,
+                            'person_id': person_id
                         })
                 
                 # Update current results
@@ -583,11 +595,23 @@ def main(source=0, max_people=5, yolo_model='yolov8n.pt', single_person=False):
         # Update characters
         results_list = detector.get_results()
         
-        # No artificial spacing - landmarks are already in correct positions
-        for i, result in enumerate(results_list):
-            if i < len(characters):
-                characters[i].update_landmarks(result['landmarks'])
-                characters[i].set_offset(0)  # No offset - use actual positions
+        # Map person_id to character with consistent color
+        active_characters = {}
+        for result in results_list:
+            person_id = result.get('person_id', 0)
+            
+            # Get or create character for this person_id
+            if person_id not in active_characters:
+                if person_id < len(characters):
+                    active_characters[person_id] = characters[person_id]
+                else:
+                    # Create new character if needed (shouldn't happen with proper max_people)
+                    color = colors[person_id % len(colors)]
+                    active_characters[person_id] = Character3D(color=color, person_id=person_id)
+            
+            # Update character
+            active_characters[person_id].update_landmarks(result['landmarks'])
+            active_characters[person_id].set_offset(0)  # No offset - use actual positions
         
         # Clear screen
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
@@ -616,10 +640,9 @@ def main(source=0, max_people=5, yolo_model='yolov8n.pt', single_person=False):
         # Draw scene
         draw_grid()
         
-        # Draw all detected people
-        for i in range(len(results_list)):
-            if i < len(characters):
-                characters[i].draw()
+        # Draw all detected people with consistent IDs
+        for person_id, character in active_characters.items():
+            character.draw()
         
         # Update display
         pygame.display.flip()
